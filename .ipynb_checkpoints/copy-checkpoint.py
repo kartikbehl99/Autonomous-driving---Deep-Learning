@@ -1,0 +1,363 @@
+{
+ "cells": [
+  {
+   "cell_type": "code",
+   "execution_count": 84,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import numpy as np\n",
+    "import pandas as pd\n",
+    "import cv2, os\n",
+    "from sklearn.model_selection import train_test_split\n",
+    "from keras.models import Sequential\n",
+    "from keras.layers import Lambda, Conv2D, MaxPool2D, Dropout, Dense, Flatten\n",
+    "from keras.optimizers import Adam\n",
+    "from keras.callbacks import ModelCheckpoint\n",
+    "import argparse\n",
+    "import matplotlib.image as mpimg\n",
+    "import PIL\n",
+    "from utils import INPUT_SHAPE, batch_generator"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 75,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "IMAGE_HEIGHT, IMAGE_WIDTH, IMAGE_CHANNELS = 66, 200, 3\n",
+    "INPUT_SHAPE = (IMAGE_HEIGHT, IMAGE_WIDTH, IMAGE_CHANNELS)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 76,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def load_image(data_dir, image_file):\n",
+    "#     Loaf RGB image from a file\n",
+    "    data_dir += '/Autonomous_driving/'\n",
+    "    return mpimg.imread(os.path.join(data_dir, image_file.strip()))\n",
+    "\n",
+    "def crop(image):\n",
+    "#     Crop the image (removing the sky at the top and the car front at the bottom)\n",
+    "    return image[60:-25, :, :]\n",
+    "\n",
+    "def resize(image):\n",
+    "#     Resize the image to the input shape used by the model\n",
+    "    return cv2.resize(image, (IMAGE_WIDTH, IMAGE_HEIGHT), cv2.INTER_AREA)\n",
+    "\n",
+    "def rgb2yuv(image):\n",
+    "#     Convert the image from RGB to YUB format(This is what Nvidia model uses)\n",
+    "    return cv2.cvtColor(image, cv2.COLOR_RGB2YUV)\n",
+    "\n",
+    "def preprocess(image):\n",
+    "#     Combining the above\n",
+    "    image = crop(image)\n",
+    "    image = resize(image)\n",
+    "    image = rgb2yuv(image)\n",
+    "    return image\n",
+    "\n",
+    "def choose_image(data_dir, center, left, right, steering_angle):\n",
+    "#     Randomly choose an image from the center, left or right and adjust\n",
+    "#     the steering angle\n",
+    "    choice  = np.random.choice(3)\n",
+    "    \n",
+    "    if choice == 0:\n",
+    "        return load_image(data_dir, left), steering_angle + 0.2\n",
+    "    elif choice == 1:\n",
+    "        return load_image(data_dir, right), steering_angle - 0.2\n",
+    "    \n",
+    "    return load_image(data_dir, center), steering_angle\n",
+    "\n",
+    "def random_flip(image, steering_angle):\n",
+    "#     Randomly flup the image left <-> right and adjust the steering angle\n",
+    "    if np.random.rand() < 0.5:\n",
+    "        image = cv2.flip(image, 1)\n",
+    "        steering_angle = -steering_angle\n",
+    "    \n",
+    "    return image, steering_angle\n",
+    "\n",
+    "def random_translate(image, steering_angle, range_x, range_y):\n",
+    "#     Randomly shift the image vertically and horizontally\n",
+    "    trans_x = range_x * (np.random.rand() - 0.5)\n",
+    "    trans_y = range_y * (np.random.rand() - 0.5)\n",
+    "    steering_angle += trans_x * 0.002\n",
+    "    trans_m = np.float32([[1, 0, trans_x], [0, 1, trans_y]])\n",
+    "    height, width = image.shape[:2]\n",
+    "    image = cv2.warpAffine(image, trans_m, (width, height))\n",
+    "    return image, steering_angle\n",
+    "\n",
+    "def random_shadow(image):\n",
+    "#     Generates and adds random shadow\n",
+    "#     xm, ym gives the location of the image\n",
+    "    x1, y1 = IMAGE_WIDTH * np.random.rand(), 0\n",
+    "    x2, y2 = IMAGE_WIDTH * np.random.rand(), IMAGE_HEIGHT\n",
+    "    xm, ym = np.mgrid[0:IMAGE_HEIGHT, 0:IMAGE_WIDTH]\n",
+    "    \n",
+    "    \n",
+    "#     mathematically speaking, we want to set 1 below the line and zero otherwise\n",
+    "#     Our coordinate is up side down.  So, the above the line: \n",
+    "#     (ym-y1)/(xm-x1) > (y2-y1)/(x2-x1)\n",
+    "#     as x2 == x1 causes zero-division problem, we'll write it in the below form:\n",
+    "#     (ym-y1)*(x2-x1) - (y2-y1)*(xm-x1) > 0\n",
+    "    mask = np.zeros_like(image[:, :, 1])\n",
+    "    mask[(ym - y1) * (x2 - x1) - (y2 - y1) * (xm - x1) > 0] = 1\n",
+    "\n",
+    "#     choose which side should have shadow and adjust saturation\n",
+    "    cond = mask == np.random.randint(2)\n",
+    "    s_ratio = np.random.uniform(low=0.2, high=0.5)\n",
+    "\n",
+    "#     adjust Saturation in HLS(Hue, Light, Saturation)\n",
+    "    hls = cv2.cvtColor(image, cv2.COLOR_RGB2HLS)\n",
+    "    hls[:, :, 1][cond] = hls[:, :, 1][cond] * s_ratio\n",
+    "    return cv2.cvtColor(hls, cv2.COLOR_HLS2RGB)\n",
+    "\n",
+    "def random_brightness(image):\n",
+    "#     Randomly adjust the brightness of the image\n",
+    "#     HSV(hue, saturation, value) is also called HSB('B' for brightness)\n",
+    "    hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)\n",
+    "    ratio = 1.0 + 0.4 * (npm.random.rand() - 0.5)\n",
+    "    hsv[:,:,2] = hsv[:,:,2] * ratio\n",
+    "    return cv2.cvtColot(hsv, cv2.COLOR_HSV2RGB)\n",
+    "\n",
+    "def augment(data_dir, center, left, right, steering_angle, range_x = 100, range_y = 10):\n",
+    "#     Generated augmented image and adjust steering angle\n",
+    "#     The steering angle is associated with the center image\n",
+    "    image, steering_angle = choose_image(data_dir, center, left, right, steering_angle)\n",
+    "    image, steering_angle = random_flip(image, steering_angle)\n",
+    "    image, steering_angle = random_translate(image, steering_angle, range_x, range_y)\n",
+    "    image = random_shadow(image)\n",
+    "    image = random_brightness(image)\n",
+    "    return image, steering_angle\n",
+    "\n",
+    "def batch_generator(data_dir, image_paths, steering_angles, batch_size, is_training):\n",
+    "#     Generate training images given image paths and associated training angles\n",
+    "    images = np.empty([batch_size, IMAGE_WIDTH, IMAGE_HEIGHT, IMAGE_CHANNELS])\n",
+    "    steers = np.empty(batch_size)\n",
+    "    \n",
+    "    while True:\n",
+    "        i = 0\n",
+    "        for index in np.random.permutation(image_paths.shape[0]):\n",
+    "            center, left, right = image_paths[index]\n",
+    "            steering_angle = steering_angles[index]\n",
+    "\n",
+    "            if is_training and np.random.rand() < 0.6:\n",
+    "                image, steering_angle = augment(data_dir, center, left, right, steering_angle)\n",
+    "            else:\n",
+    "                image = load_image(data_dir, center)\n",
+    "\n",
+    "            images[i] = preprocess(image)\n",
+    "            steers[i] = steering_angle\n",
+    "            i += 1\n",
+    "            if i == batch_size:\n",
+    "                break\n",
+    "        \n",
+    "        yield images, steers"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 85,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def load_data():\n",
+    "    df = pd.read_csv(os.path.join('/home/kartik/Desktop/Autonomous_driving/driving_log.csv'))\n",
+    "    x = df[['center', 'left', 'right']].values\n",
+    "    y = df['steering']\n",
+    "    \n",
+    "    X_train, X_test, Y_train, Y_test = train_test_split(x, y, test_size = 0.2)\n",
+    "    return X_train, X_test, Y_train, Y_test"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 86,
+   "metadata": {
+    "scrolled": true
+   },
+   "outputs": [],
+   "source": [
+    "def build_model():\n",
+    "#     Creating a sequential model\n",
+    "    model = Sequential()\n",
+    "#     Normalizing the images\n",
+    "    model.add(Lambda(lambda x: x/127.5 - 1.0, input_shape=INPUT_SHAPE))\n",
+    "#     Adding the convolution layers\n",
+    "    model.add(Conv2D(24, (5, 5), activation='elu', strides=(2,2)))\n",
+    "    model.add(Conv2D(36, (5, 5), activation='elu', strides=(2,2)))\n",
+    "    model.add(Conv2D(48, (5, 5), activation='elu', strides=(2,2)))\n",
+    "    model.add(Conv2D(64, (3, 3), activation='elu'))\n",
+    "    model.add(Conv2D(64, (3, 3), activation='elu'))\n",
+    "#     Adding dropout to prevent overfitting\n",
+    "    model.add(Dropout(0.5))\n",
+    "#     Flattening in order to provide it to the dense layers\n",
+    "    model.add(Flatten())\n",
+    "#     Adding the dense layers\n",
+    "    model.add(Dense(100, activation='elu'))\n",
+    "    model.add(Dense(50, activation='elu'))\n",
+    "    model.add(Dense(10, activation='elu'))\n",
+    "#     The final layer, hence no activation function\n",
+    "    model.add(Dense(1))\n",
+    "#     Returning the model summary\n",
+    "    model.summary()\n",
+    "    return model"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 87,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def train_model(X_train, X_test, Y_train, Y_test, model):\n",
+    "    checkpoint = ModelCheckpoint('model-{epoch-03d}.h5', \n",
+    "                                 monitor='val-loss', \n",
+    "                                 verbose=0, \n",
+    "                                 save_best_only=True, \n",
+    "                                 save_weights_only=False, \n",
+    "                                 mode='auto')\n",
+    "    \n",
+    "    model.compile(loss='mean_squared_error', optimizer=Adam(lr=0.0001))\n",
+    "    \n",
+    "    model.fit_generator(batch_generator('/home/kartik/Desktop/Autonomous_driving/driving_log.csv', X_train, Y_train, 40, True),\n",
+    "                       20000,\n",
+    "                       10,\n",
+    "                       max_q_size=1,\n",
+    "                       validation_data = batch_generator('/home/kartik/Desktop/Autonomous_driving/driving_log.csv', X_test, Y_test, 840, False),\n",
+    "                       nb_val_samples=len(X_test),\n",
+    "                       callbacks=[checkpoint],\n",
+    "                       verbose=1)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 88,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "X_train, X_test, Y_train, Y_test = load_data()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 89,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "_________________________________________________________________\n",
+      "Layer (type)                 Output Shape              Param #   \n",
+      "=================================================================\n",
+      "lambda_10 (Lambda)           (None, 66, 200, 3)        0         \n",
+      "_________________________________________________________________\n",
+      "conv2d_46 (Conv2D)           (None, 31, 98, 24)        1824      \n",
+      "_________________________________________________________________\n",
+      "conv2d_47 (Conv2D)           (None, 14, 47, 36)        21636     \n",
+      "_________________________________________________________________\n",
+      "conv2d_48 (Conv2D)           (None, 5, 22, 48)         43248     \n",
+      "_________________________________________________________________\n",
+      "conv2d_49 (Conv2D)           (None, 3, 20, 64)         27712     \n",
+      "_________________________________________________________________\n",
+      "conv2d_50 (Conv2D)           (None, 1, 18, 64)         36928     \n",
+      "_________________________________________________________________\n",
+      "dropout_10 (Dropout)         (None, 1, 18, 64)         0         \n",
+      "_________________________________________________________________\n",
+      "flatten_10 (Flatten)         (None, 1152)              0         \n",
+      "_________________________________________________________________\n",
+      "dense_37 (Dense)             (None, 100)               115300    \n",
+      "_________________________________________________________________\n",
+      "dense_38 (Dense)             (None, 50)                5050      \n",
+      "_________________________________________________________________\n",
+      "dense_39 (Dense)             (None, 10)                510       \n",
+      "_________________________________________________________________\n",
+      "dense_40 (Dense)             (None, 1)                 11        \n",
+      "=================================================================\n",
+      "Total params: 252,219\n",
+      "Trainable params: 252,219\n",
+      "Non-trainable params: 0\n",
+      "_________________________________________________________________\n"
+     ]
+    }
+   ],
+   "source": [
+    "model = build_model()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 92,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/home/kartik/anaconda3/envs/tensorflow/lib/python3.6/site-packages/ipykernel_launcher.py:18: UserWarning: The semantics of the Keras 2 argument `steps_per_epoch` is not the same as the Keras 1 argument `samples_per_epoch`. `steps_per_epoch` is the number of batches to draw from the generator at each epoch. Basically steps_per_epoch = samples_per_epoch/batch_size. Similarly `nb_val_samples`->`validation_steps` and `val_samples`->`steps` arguments have changed. Update your method calls accordingly.\n",
+      "/home/kartik/anaconda3/envs/tensorflow/lib/python3.6/site-packages/ipykernel_launcher.py:18: UserWarning: Update your `fit_generator` call to the Keras 2 API: `fit_generator(<generator..., 20000, 10, validation_data=<generator..., callbacks=[<keras.ca..., verbose=1, validation_steps=840, max_queue_size=1)`\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 1/10\n"
+     ]
+    },
+    {
+     "ename": "IndexError",
+     "evalue": "boolean index did not match indexed array along dimension 0; dimension is 160 but corresponding boolean dimension is 66",
+     "output_type": "error",
+     "traceback": [
+      "\u001b[0;31m---------------------------------------------------------------------------\u001b[0m",
+      "\u001b[0;31mIndexError\u001b[0m                                Traceback (most recent call last)",
+      "\u001b[0;32m<ipython-input-92-30b95ebf39cc>\u001b[0m in \u001b[0;36m<module>\u001b[0;34m\u001b[0m\n\u001b[0;32m----> 1\u001b[0;31m \u001b[0mtrain_model\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mX_train\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mX_test\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mY_train\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mY_test\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mmodel\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0m",
+      "\u001b[0;32m<ipython-input-87-e094f53c0c9f>\u001b[0m in \u001b[0;36mtrain_model\u001b[0;34m(X_train, X_test, Y_train, Y_test, model)\u001b[0m\n\u001b[1;32m     16\u001b[0m                        \u001b[0mnb_val_samples\u001b[0m\u001b[0;34m=\u001b[0m\u001b[0mlen\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mX_test\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m,\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m     17\u001b[0m                        \u001b[0mcallbacks\u001b[0m\u001b[0;34m=\u001b[0m\u001b[0;34m[\u001b[0m\u001b[0mcheckpoint\u001b[0m\u001b[0;34m]\u001b[0m\u001b[0;34m,\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0;32m---> 18\u001b[0;31m                        verbose=1)\n\u001b[0m",
+      "\u001b[0;32m~/anaconda3/envs/tensorflow/lib/python3.6/site-packages/keras/legacy/interfaces.py\u001b[0m in \u001b[0;36mwrapper\u001b[0;34m(*args, **kwargs)\u001b[0m\n\u001b[1;32m     89\u001b[0m                 warnings.warn('Update your `' + object_name + '` call to the ' +\n\u001b[1;32m     90\u001b[0m                               'Keras 2 API: ' + signature, stacklevel=2)\n\u001b[0;32m---> 91\u001b[0;31m             \u001b[0;32mreturn\u001b[0m \u001b[0mfunc\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0;34m*\u001b[0m\u001b[0margs\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0;34m**\u001b[0m\u001b[0mkwargs\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0m\u001b[1;32m     92\u001b[0m         \u001b[0mwrapper\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0m_original_function\u001b[0m \u001b[0;34m=\u001b[0m \u001b[0mfunc\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m     93\u001b[0m         \u001b[0;32mreturn\u001b[0m \u001b[0mwrapper\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n",
+      "\u001b[0;32m~/anaconda3/envs/tensorflow/lib/python3.6/site-packages/keras/engine/training.py\u001b[0m in \u001b[0;36mfit_generator\u001b[0;34m(self, generator, steps_per_epoch, epochs, verbose, callbacks, validation_data, validation_steps, class_weight, max_queue_size, workers, use_multiprocessing, shuffle, initial_epoch)\u001b[0m\n\u001b[1;32m   1416\u001b[0m             \u001b[0muse_multiprocessing\u001b[0m\u001b[0;34m=\u001b[0m\u001b[0muse_multiprocessing\u001b[0m\u001b[0;34m,\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m   1417\u001b[0m             \u001b[0mshuffle\u001b[0m\u001b[0;34m=\u001b[0m\u001b[0mshuffle\u001b[0m\u001b[0;34m,\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0;32m-> 1418\u001b[0;31m             initial_epoch=initial_epoch)\n\u001b[0m\u001b[1;32m   1419\u001b[0m \u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m   1420\u001b[0m     \u001b[0;34m@\u001b[0m\u001b[0minterfaces\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mlegacy_generator_methods_support\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n",
+      "\u001b[0;32m~/anaconda3/envs/tensorflow/lib/python3.6/site-packages/keras/engine/training_generator.py\u001b[0m in \u001b[0;36mfit_generator\u001b[0;34m(model, generator, steps_per_epoch, epochs, verbose, callbacks, validation_data, validation_steps, class_weight, max_queue_size, workers, use_multiprocessing, shuffle, initial_epoch)\u001b[0m\n\u001b[1;32m    179\u001b[0m             \u001b[0mbatch_index\u001b[0m \u001b[0;34m=\u001b[0m \u001b[0;36m0\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m    180\u001b[0m             \u001b[0;32mwhile\u001b[0m \u001b[0msteps_done\u001b[0m \u001b[0;34m<\u001b[0m \u001b[0msteps_per_epoch\u001b[0m\u001b[0;34m:\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0;32m--> 181\u001b[0;31m                 \u001b[0mgenerator_output\u001b[0m \u001b[0;34m=\u001b[0m \u001b[0mnext\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0moutput_generator\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0m\u001b[1;32m    182\u001b[0m \u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m    183\u001b[0m                 \u001b[0;32mif\u001b[0m \u001b[0;32mnot\u001b[0m \u001b[0mhasattr\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mgenerator_output\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0;34m'__len__'\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m:\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n",
+      "\u001b[0;32m~/anaconda3/envs/tensorflow/lib/python3.6/site-packages/keras/utils/data_utils.py\u001b[0m in \u001b[0;36mget\u001b[0;34m(self)\u001b[0m\n\u001b[1;32m    707\u001b[0m                     \u001b[0;34m\"`use_multiprocessing=False, workers > 1`.\"\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m    708\u001b[0m                     \"For more information see issue #1638.\")\n\u001b[0;32m--> 709\u001b[0;31m             \u001b[0msix\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mreraise\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0;34m*\u001b[0m\u001b[0msys\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mexc_info\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0m",
+      "\u001b[0;32m~/anaconda3/envs/tensorflow/lib/python3.6/site-packages/six.py\u001b[0m in \u001b[0;36mreraise\u001b[0;34m(tp, value, tb)\u001b[0m\n\u001b[1;32m    691\u001b[0m             \u001b[0;32mif\u001b[0m \u001b[0mvalue\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0m__traceback__\u001b[0m \u001b[0;32mis\u001b[0m \u001b[0;32mnot\u001b[0m \u001b[0mtb\u001b[0m\u001b[0;34m:\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m    692\u001b[0m                 \u001b[0;32mraise\u001b[0m \u001b[0mvalue\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mwith_traceback\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mtb\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0;32m--> 693\u001b[0;31m             \u001b[0;32mraise\u001b[0m \u001b[0mvalue\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0m\u001b[1;32m    694\u001b[0m         \u001b[0;32mfinally\u001b[0m\u001b[0;34m:\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m    695\u001b[0m             \u001b[0mvalue\u001b[0m \u001b[0;34m=\u001b[0m \u001b[0;32mNone\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n",
+      "\u001b[0;32m~/anaconda3/envs/tensorflow/lib/python3.6/site-packages/keras/utils/data_utils.py\u001b[0m in \u001b[0;36mget\u001b[0;34m(self)\u001b[0m\n\u001b[1;32m    683\u001b[0m         \u001b[0;32mtry\u001b[0m\u001b[0;34m:\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m    684\u001b[0m             \u001b[0;32mwhile\u001b[0m \u001b[0mself\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mis_running\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m:\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0;32m--> 685\u001b[0;31m                 \u001b[0minputs\u001b[0m \u001b[0;34m=\u001b[0m \u001b[0mself\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mqueue\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mget\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mblock\u001b[0m\u001b[0;34m=\u001b[0m\u001b[0;32mTrue\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mget\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0m\u001b[1;32m    686\u001b[0m                 \u001b[0mself\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mqueue\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mtask_done\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m    687\u001b[0m                 \u001b[0;32mif\u001b[0m \u001b[0minputs\u001b[0m \u001b[0;32mis\u001b[0m \u001b[0;32mnot\u001b[0m \u001b[0;32mNone\u001b[0m\u001b[0;34m:\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n",
+      "\u001b[0;32m~/anaconda3/envs/tensorflow/lib/python3.6/multiprocessing/pool.py\u001b[0m in \u001b[0;36mget\u001b[0;34m(self, timeout)\u001b[0m\n\u001b[1;32m    668\u001b[0m             \u001b[0;32mreturn\u001b[0m \u001b[0mself\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0m_value\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m    669\u001b[0m         \u001b[0;32melse\u001b[0m\u001b[0;34m:\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0;32m--> 670\u001b[0;31m             \u001b[0;32mraise\u001b[0m \u001b[0mself\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0m_value\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0m\u001b[1;32m    671\u001b[0m \u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m    672\u001b[0m     \u001b[0;32mdef\u001b[0m \u001b[0m_set\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mself\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mi\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mobj\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m:\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n",
+      "\u001b[0;32m~/anaconda3/envs/tensorflow/lib/python3.6/multiprocessing/pool.py\u001b[0m in \u001b[0;36mworker\u001b[0;34m(inqueue, outqueue, initializer, initargs, maxtasks, wrap_exception)\u001b[0m\n\u001b[1;32m    117\u001b[0m         \u001b[0mjob\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mi\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mfunc\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0margs\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mkwds\u001b[0m \u001b[0;34m=\u001b[0m \u001b[0mtask\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m    118\u001b[0m         \u001b[0;32mtry\u001b[0m\u001b[0;34m:\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0;32m--> 119\u001b[0;31m             \u001b[0mresult\u001b[0m \u001b[0;34m=\u001b[0m \u001b[0;34m(\u001b[0m\u001b[0;32mTrue\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mfunc\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0;34m*\u001b[0m\u001b[0margs\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0;34m**\u001b[0m\u001b[0mkwds\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0m\u001b[1;32m    120\u001b[0m         \u001b[0;32mexcept\u001b[0m \u001b[0mException\u001b[0m \u001b[0;32mas\u001b[0m \u001b[0me\u001b[0m\u001b[0;34m:\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m    121\u001b[0m             \u001b[0;32mif\u001b[0m \u001b[0mwrap_exception\u001b[0m \u001b[0;32mand\u001b[0m \u001b[0mfunc\u001b[0m \u001b[0;32mis\u001b[0m \u001b[0;32mnot\u001b[0m \u001b[0m_helper_reraises_exception\u001b[0m\u001b[0;34m:\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n",
+      "\u001b[0;32m~/anaconda3/envs/tensorflow/lib/python3.6/site-packages/keras/utils/data_utils.py\u001b[0m in \u001b[0;36mnext_sample\u001b[0;34m(uid)\u001b[0m\n\u001b[1;32m    624\u001b[0m         \u001b[0mThe\u001b[0m \u001b[0mnext\u001b[0m \u001b[0mvalue\u001b[0m \u001b[0mof\u001b[0m \u001b[0mgenerator\u001b[0m\u001b[0;31m \u001b[0m\u001b[0;31m`\u001b[0m\u001b[0muid\u001b[0m\u001b[0;31m`\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m    625\u001b[0m     \"\"\"\n\u001b[0;32m--> 626\u001b[0;31m     \u001b[0;32mreturn\u001b[0m \u001b[0msix\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mnext\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0m_SHARED_SEQUENCES\u001b[0m\u001b[0;34m[\u001b[0m\u001b[0muid\u001b[0m\u001b[0;34m]\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0m\u001b[1;32m    627\u001b[0m \u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m    628\u001b[0m \u001b[0;34m\u001b[0m\u001b[0m\n",
+      "\u001b[0;32m~/Desktop/Autonomous_driving/utils.py\u001b[0m in \u001b[0;36mbatch_generator\u001b[0;34m(data_dir, image_paths, steering_angles, batch_size, is_training)\u001b[0m\n\u001b[1;32m    147\u001b[0m             \u001b[0;31m# argumentation\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m    148\u001b[0m             \u001b[0;32mif\u001b[0m \u001b[0mis_training\u001b[0m \u001b[0;32mand\u001b[0m \u001b[0mnp\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mrandom\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mrand\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0;34m)\u001b[0m \u001b[0;34m<\u001b[0m \u001b[0;36m0.6\u001b[0m\u001b[0;34m:\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0;32m--> 149\u001b[0;31m                 \u001b[0mimage\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0msteering_angle\u001b[0m \u001b[0;34m=\u001b[0m \u001b[0maugument\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mdata_dir\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mcenter\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mleft\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mright\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0msteering_angle\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0m\u001b[1;32m    150\u001b[0m             \u001b[0;32melse\u001b[0m\u001b[0;34m:\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m    151\u001b[0m                 \u001b[0mimage\u001b[0m \u001b[0;34m=\u001b[0m \u001b[0mload_image\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mdata_dir\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mcenter\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n",
+      "\u001b[0;32m~/Desktop/Autonomous_driving/utils.py\u001b[0m in \u001b[0;36maugument\u001b[0;34m(data_dir, center, left, right, steering_angle, range_x, range_y)\u001b[0m\n\u001b[1;32m    129\u001b[0m     \u001b[0mimage\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0msteering_angle\u001b[0m \u001b[0;34m=\u001b[0m \u001b[0mrandom_flip\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mimage\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0msteering_angle\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m    130\u001b[0m     \u001b[0mimage\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0msteering_angle\u001b[0m \u001b[0;34m=\u001b[0m \u001b[0mrandom_translate\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mimage\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0msteering_angle\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mrange_x\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mrange_y\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0;32m--> 131\u001b[0;31m     \u001b[0mimage\u001b[0m \u001b[0;34m=\u001b[0m \u001b[0mrandom_shadow\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mimage\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0m\u001b[1;32m    132\u001b[0m     \u001b[0mimage\u001b[0m \u001b[0;34m=\u001b[0m \u001b[0mrandom_brightness\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mimage\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m    133\u001b[0m     \u001b[0;32mreturn\u001b[0m \u001b[0mimage\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0msteering_angle\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n",
+      "\u001b[0;32m~/Desktop/Autonomous_driving/utils.py\u001b[0m in \u001b[0;36mrandom_shadow\u001b[0;34m(image)\u001b[0m\n\u001b[1;32m     98\u001b[0m     \u001b[0;31m# (ym-y1)*(x2-x1) - (y2-y1)*(xm-x1) > 0\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m     99\u001b[0m     \u001b[0mmask\u001b[0m \u001b[0;34m=\u001b[0m \u001b[0mnp\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mzeros_like\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mimage\u001b[0m\u001b[0;34m[\u001b[0m\u001b[0;34m:\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0;34m:\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0;36m1\u001b[0m\u001b[0;34m]\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0;32m--> 100\u001b[0;31m     \u001b[0mmask\u001b[0m\u001b[0;34m[\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mym\u001b[0m \u001b[0;34m-\u001b[0m \u001b[0my1\u001b[0m\u001b[0;34m)\u001b[0m \u001b[0;34m*\u001b[0m \u001b[0;34m(\u001b[0m\u001b[0mx2\u001b[0m \u001b[0;34m-\u001b[0m \u001b[0mx1\u001b[0m\u001b[0;34m)\u001b[0m \u001b[0;34m-\u001b[0m \u001b[0;34m(\u001b[0m\u001b[0my2\u001b[0m \u001b[0;34m-\u001b[0m \u001b[0my1\u001b[0m\u001b[0;34m)\u001b[0m \u001b[0;34m*\u001b[0m \u001b[0;34m(\u001b[0m\u001b[0mxm\u001b[0m \u001b[0;34m-\u001b[0m \u001b[0mx1\u001b[0m\u001b[0;34m)\u001b[0m \u001b[0;34m>\u001b[0m \u001b[0;36m0\u001b[0m\u001b[0;34m]\u001b[0m \u001b[0;34m=\u001b[0m \u001b[0;36m1\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0m\u001b[1;32m    101\u001b[0m \u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m    102\u001b[0m     \u001b[0;31m# choose which side should have shadow and adjust saturation\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n",
+      "\u001b[0;31mIndexError\u001b[0m: boolean index did not match indexed array along dimension 0; dimension is 160 but corresponding boolean dimension is 66"
+     ]
+    }
+   ],
+   "source": [
+    "train_model(X_train, X_test, Y_train, Y_test, model)"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.6.7"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 2
+}
